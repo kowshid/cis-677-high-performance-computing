@@ -1,0 +1,261 @@
+{
+  "format": "hpcbench/task/1",
+  "requested_by": "kowshid",
+  "key_kind": "personal",
+  "source_included": true,
+  "ingest_path": "/api/public/ingest",
+  "input_path": "/api/public/task/cis677-p1/input",
+  "task": "cis677-p1",
+  "title": "Dense \u00d7 sparse matrix multiply",
+  "status": "open",
+  "kill_factor": 2,
+  "config": {
+    "sweep_arg": "k",
+    "sweep_values": [
+      8,
+      16,
+      32,
+      64,
+      128,
+      256
+    ],
+    "canon_sig_digits": 8,
+    "sanity_timeout_s": 120,
+    "threads": 4,
+    "mem_limit_mb": 32768,
+    "full_credit_at": 8,
+    "metric_label": "Geometric-mean speedup",
+    "correctness_mode": "tolerance",
+    "correctness_rel_tol": 0.01,
+    "verify_seed": "ba7c26882c39d5dae13d9dfd420c279f",
+    "audit_enabled": true,
+    "audit_path": "/api/public/task/cis677-p1/audit"
+  },
+  "input": {
+    "mode": "url",
+    "url": "https://raw.githubusercontent.com/zdebruine/cis677-hpcbench/main/data/p1-kernel/pbmc3k.npz",
+    "sha256": "840600d40f18954912cda4fe2a6bdbe6b11836750879d1f3e3cc5395770ee9c2",
+    "prepare_cmd": "curl -fsSL https://raw.githubusercontent.com/zdebruine/cis677-hpcbench/main/tools/make_p1_input.py -o make_p1_input.py && python3 make_p1_input.py --packed \"$HPCBENCH_INPUT\" --variant public --out \"$HPCBENCH_INPUT_OUT\"",
+    "storage": false,
+    "notes": "u64 n_cells, u64 n_genes, then n_cells*n_genes float64 row-major (cells x genes). Rebuilt locally from the 4.4 MB packed pbmc3k matrix; requires python3 with numpy.",
+    "bytes": 296236816
+  },
+  "contract": {
+    "build_cmd": "sh ./build.sh",
+    "prepare_cmd": "./build/task prepare {input} {work}",
+    "run_cmd": "./build/task solve {work} {result} {sweep}"
+  },
+  "harness": {
+    "src/main.cpp": "// The fixed harness now lives in harness.cpp, which is linked into every entry.\n// Nothing is compiled from this file; it is kept only so an older tool that\n// writes src/main.cpp does not write a stale harness there.\n",
+    "files": {
+      "harness.cpp": "// ============================================================================\n// hpcbench fixed harness -- CIS 677 P1. HOST-OWNED. DO NOT EDIT: every entry is\n// compiled and linked against this file exactly as written.\n//\n// One binary, two modes:\n//\n//     ./build/task prepare <raw_input> <workdir>      UNTIMED\n//     ./build/task solve   <workdir> <result.bin> <k> TIMED\n//\n// `prepare` reads the raw corpus and calls the entry's `hpcbench::prepare`,\n// which writes whatever representation it wants into the workdir.\n//\n// `solve` generates the weights, allocates and zero-fills the output, then\n// starts a clock, calls the entry's `hpcbench::solve`, and stops it. Reading the\n// entry's own representation happens inside `solve` and is therefore on the\n// clock -- that is the point of the design. Everything the host does is outside\n// it: process start-up, generating W, allocating Y, writing result.bin and\n// digesting it are no longer charged to anyone.\n//\n// The timed region is announced on stdout, always, around the call:\n//\n//     HPCBENCH_SOLVE_BEGIN\n//     HPCBENCH_SOLVE_END\n//     HPCBENCH_TIME_MS <milliseconds>\n//\n// The last line is printed only where the platform has a monotonic clock. The\n// browser's wasm sysroot does not implement clock_time_get, so a `steady_clock`\n// call there traps; the in-tab runner instead timestamps the two markers as it\n// receives them, which measures the same region from outside the program.\n//\n// DIMENSIONS. The workdir belongs to the entry and the host does not parse it,\n// so `prepare` mode records the corpus dimensions in a host-owned sidecar,\n// <workdir>/.hpcbench-dims (two little-endian u64: n_cells, n_genes). `solve`\n// reads that, not the entry's files, to size W and Y. Reading it is untimed.\n// ============================================================================\n#define HPCBENCH_HARNESS_TU 1\n\n#include \"canon.hpp\"\n#include \"task.hpp\"\n\n#if defined(__wasm__) || defined(__EMSCRIPTEN__)\n// No clock_time_get in this sysroot: calling steady_clock::now() traps.\n#define HPCBENCH_NO_STEADY_CLOCK 1\n#else\n#include <chrono>\n#endif\n\n#include <cstdint>\n#include <cstdio>\n#include <cstdlib>\n#include <cstring>\n#include <string>\n#include <vector>\n\nnamespace {\n\nconst char* kDimsFile = \"/.hpcbench-dims\";\n\nvoid write_dims(const std::string& workdir, std::uint64_t n_cells, std::uint64_t n_genes) {\n  hpcbench::Writer w(workdir + kDimsFile);\n  w.write_value(n_cells);\n  w.write_value(n_genes);\n  w.close();\n}\n\nvoid read_dims(const std::string& workdir, std::uint64_t& n_cells, std::uint64_t& n_genes) {\n  hpcbench::Reader r(workdir + kDimsFile);\n  n_cells = r.read_value<std::uint64_t>();\n  n_genes = r.read_value<std::uint64_t>();\n  if (n_cells == 0 || n_genes == 0) hpcbench::fatal(\"workdir dimensions are empty; re-run prepare\");\n}\n\nint usage() {\n  std::fprintf(stderr,\n               \"usage: task prepare <raw_input> <workdir>\\n\"\n               \"       task solve   <workdir> <result.bin> <k>\\n\");\n  return 2;\n}\n\n}  // namespace\n\nint main(int argc, char** argv) {\n  if (argc < 2) return usage();\n  const std::string mode = argv[1];\n\n  if (mode == \"prepare\") {\n    if (argc < 4) return usage();\n    const std::string workdir = argv[3];\n\n    std::uint64_t n_cells = 0, n_genes = 0;\n    std::vector<double> X;\n    if (!hpcbench::read_raw_input(argv[2], n_cells, n_genes, X)) return 1;\n\n    hpcbench::Input in{n_cells, n_genes, X.data()};\n    hpcbench::Sink sink{workdir};\n    hpcbench::prepare(in, sink);\n    write_dims(workdir, n_cells, n_genes);\n\n    std::fprintf(stderr, \"prepare: %llu x %llu\\n\", (unsigned long long)n_cells,\n                 (unsigned long long)n_genes);\n    return 0;\n  }\n\n  if (mode == \"solve\") {\n    if (argc < 5) return usage();\n    const std::string workdir = argv[2];\n    const std::string result_path = argv[3];\n    const std::uint64_t k = std::strtoull(argv[4], nullptr, 10);\n    if (k == 0) hpcbench::fatal(\"k must be a positive integer\");\n\n    std::uint64_t n_cells = 0, n_genes = 0;\n    read_dims(workdir, n_cells, n_genes);\n\n    // Untimed: the problem definition and the output buffer.\n    const std::vector<double> W = hpcbench::gen_W(n_genes, k);\n    std::vector<double> Y(n_cells * k, 0.0);\n\n    hpcbench::Work work{workdir};\n    hpcbench::Params params{k, W.data(), n_cells, n_genes};\n    hpcbench::Result out{Y.data(), n_cells, k};\n\n    // The markers bracket the timed region for a runner with no clock inside\n    // the program. They are flushed so the timestamps are the real boundaries.\n    std::printf(\"HPCBENCH_SOLVE_BEGIN\\n\");\n    std::fflush(stdout);\n#ifndef HPCBENCH_NO_STEADY_CLOCK\n    const auto t0 = std::chrono::steady_clock::now();\n#endif\n    hpcbench::solve(work, params, out);\n#ifndef HPCBENCH_NO_STEADY_CLOCK\n    const auto t1 = std::chrono::steady_clock::now();\n#endif\n    std::printf(\"HPCBENCH_SOLVE_END\\n\");\n    std::fflush(stdout);\n#ifndef HPCBENCH_NO_STEADY_CLOCK\n    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();\n    std::printf(\"HPCBENCH_TIME_MS %.6f\\n\", ms);\n    std::fflush(stdout);\n#endif\n\n    // Untimed: writing and digesting the answer.\n    hpcbench::write_result(result_path.c_str(), Y, {n_cells, k});\n    return 0;\n  }\n\n  return usage();\n}\n",
+      "include/task.hpp": "// task.hpp -- HOST-OWNED. Read-only for competitors.\n//\n// This header is the whole contract between the harness and an entry. An entry\n// is two files, each containing exactly one function and nothing else:\n//\n//     // src/prepare.cpp    UNTIMED\n//     void hpcbench::prepare(const Input& in, Sink& out);\n//\n//     // src/solution.cpp   TIMED, and only this\n//     void hpcbench::solve(const Work& w, const Params& p, Result& y);\n//\n// Everything else -- main, argv, reading the raw corpus, generating W,\n// allocating and zeroing the output, writing result.bin, computing the digest --\n// lives in harness.cpp and is not the competitor's problem.\n//\n// WHAT IS DELIBERATELY STILL YOURS. The host owns the *mechanism* of reading the\n// workdir; you own *when and how much* you read, because you call these helpers\n// yourself from inside `solve`, inside the timed region. Streaming versus\n// mapping versus slurping, lazy versus eager, one file versus shards, are real\n// levers and they stay with you.\n//\n// WHAT prepare CANNOT SEE. `k` is not in `Input` and not in `Sink`, on purpose.\n// The sweep value does not exist while your representation is being built, so it\n// cannot be tabled.\n//\n// Failures here are fatal and say why, on stderr, with the path. Nothing in the\n// harness throws: a browser tab runs these binaries against a libc++abi with no\n// unwinder, where a throw becomes an unexplained abort.\n#ifndef HPCBENCH_TASK_HPP\n#define HPCBENCH_TASK_HPP\n\n#include <fcntl.h>\n#include <sys/stat.h>\n#include <unistd.h>\n\n#include <cstddef>\n#include <cstdint>\n#include <cstdio>\n#include <cstdlib>\n#include <string>\n#include <vector>\n\n// `read_exact_fd`, `read_raw_input` and `gen_W` are host-owned too and live next\n// door; they are included here so an entry needs exactly one #include.\n#include \"task_io.hpp\"\n\n// mmap exists natively and does not exist in the wasm sysroot the in-tab runner\n// uses, so `Work::map` is a real mapping on one platform and a read into memory\n// on the other. Either way the bytes and the lifetime are the same.\n#if !defined(__wasm__) && !defined(__EMSCRIPTEN__) && !defined(_WIN32)\n#define HPCBENCH_HAVE_MMAP 1\n#include <sys/mman.h>\n#endif\n\nnamespace hpcbench {\n\n[[noreturn]] inline void fatal(const std::string& what) {\n  std::fprintf(stderr, \"hpcbench: %s\\n\", what.c_str());\n  std::fflush(stderr);\n  std::exit(1);\n}\n\n// The write-side twin of `read_exact_fd`: bounded chunks, same memfs reason.\ninline bool write_exact_fd(int fd, const void* src, std::size_t n) {\n  const unsigned char* p = static_cast<const unsigned char*>(src);\n  const std::size_t chunk = std::size_t(1) << 20;\n  while (n > 0) {\n    const std::size_t want = n < chunk ? n : chunk;\n    const ssize_t put = ::write(fd, p, want);\n    if (put <= 0) return false;\n    p += put;\n    n -= static_cast<std::size_t>(put);\n  }\n  return true;\n}\n\n// ---------------------------------------------------------------------------\n// prepare side: untimed\n// ---------------------------------------------------------------------------\n\n/** One file being written into the workdir by `prepare`. Untimed. */\nclass Writer {\n public:\n  explicit Writer(std::string path) : path_(std::move(path)) {\n    fd_ = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);\n    if (fd_ < 0) fatal(\"cannot create \" + path_);\n  }\n  Writer(const Writer&) = delete;\n  Writer& operator=(const Writer&) = delete;\n  Writer(Writer&& other) noexcept : fd_(other.fd_), path_(std::move(other.path_)) {\n    other.fd_ = -1;\n  }\n  ~Writer() { close(); }\n\n  /** Writes n bytes, or ends the process saying which file failed. */\n  void write(const void* data, std::size_t bytes) {\n    if (fd_ < 0) fatal(\"write after close on \" + path_);\n    if (bytes && !write_exact_fd(fd_, data, bytes)) fatal(\"short write to \" + path_);\n  }\n  template <typename T>\n  void write_value(const T& value) {\n    write(&value, sizeof(T));\n  }\n  void close() {\n    if (fd_ >= 0) {\n      if (::close(fd_) != 0) {\n        fd_ = -1;\n        fatal(\"failed to close \" + path_);\n      }\n      fd_ = -1;\n    }\n  }\n  const std::string& path() const { return path_; }\n\n private:\n  int fd_ = -1;\n  std::string path_;\n};\n\n/** The workdir, as `prepare` sees it: a place to create files. Untimed. */\nstruct Sink {\n  std::string dir;\n  Writer create(const char* name) const { return Writer(dir + \"/\" + name); }\n  const char* path() const { return dir.c_str(); }\n};\n\n/** The raw corpus, already read for you by the harness. Untimed, and `k` is\n *  deliberately absent. */\nstruct Input {\n  std::uint64_t n_cells;\n  std::uint64_t n_genes;\n  const double* X;  // row-major n_cells x n_genes\n};\n\n// ---------------------------------------------------------------------------\n// solve side: every call below happens INSIDE the timed region\n// ---------------------------------------------------------------------------\n\n/** A bounded streaming read of one file you wrote in prepare. */\nclass Reader {\n public:\n  explicit Reader(std::string path) : path_(std::move(path)) {\n    fd_ = ::open(path_.c_str(), O_RDONLY);\n    if (fd_ < 0) fatal(\"cannot open \" + path_);\n    struct stat st{};\n    size_ = ::fstat(fd_, &st) == 0 ? static_cast<std::uint64_t>(st.st_size) : 0;\n  }\n  Reader(const Reader&) = delete;\n  Reader& operator=(const Reader&) = delete;\n  Reader(Reader&& other) noexcept : fd_(other.fd_), size_(other.size_), path_(std::move(other.path_)) {\n    other.fd_ = -1;\n  }\n  ~Reader() { close(); }\n\n  /** Reads exactly n bytes; a short read is fatal and names the file. */\n  void read(void* dst, std::size_t bytes) {\n    if (fd_ < 0) fatal(\"read after close on \" + path_);\n    if (bytes && !read_exact_fd(fd_, dst, bytes)) fatal(\"truncated \" + path_);\n  }\n  /** Reads exactly n bytes, returning false instead of exiting at end of file. */\n  bool try_read(void* dst, std::size_t bytes) {\n    return fd_ >= 0 && (bytes == 0 || read_exact_fd(fd_, dst, bytes));\n  }\n  template <typename T>\n  T read_value() {\n    T value{};\n    read(&value, sizeof(T));\n    return value;\n  }\n  std::uint64_t size() const { return size_; }\n  void close() {\n    if (fd_ >= 0) ::close(fd_);\n    fd_ = -1;\n  }\n\n private:\n  int fd_ = -1;\n  std::uint64_t size_ = 0;\n  std::string path_;\n};\n\n/** A whole file addressable as bytes: mmap where the platform has it, a read\n *  into memory where it does not. Owns whatever it took to get there. */\nclass Mapped {\n public:\n  Mapped() = default;\n  explicit Mapped(const std::string& path) {\n    const int fd = ::open(path.c_str(), O_RDONLY);\n    if (fd < 0) fatal(\"cannot open \" + path);\n    struct stat st{};\n    if (::fstat(fd, &st) != 0) {\n      ::close(fd);\n      fatal(\"cannot size \" + path);\n    }\n    bytes_ = static_cast<std::size_t>(st.st_size);\n#ifdef HPCBENCH_HAVE_MMAP\n    if (bytes_ > 0) {\n      void* p = ::mmap(nullptr, bytes_, PROT_READ, MAP_PRIVATE, fd, 0);\n      if (p != MAP_FAILED) {\n        mapped_ = p;\n        data_ = static_cast<const std::uint8_t*>(p);\n        ::close(fd);\n        return;\n      }\n    }\n#endif\n    owned_.resize(bytes_);\n    if (bytes_ && !read_exact_fd(fd, owned_.data(), bytes_)) {\n      ::close(fd);\n      fatal(\"truncated \" + path);\n    }\n    ::close(fd);\n    data_ = owned_.data();\n  }\n  Mapped(const Mapped&) = delete;\n  Mapped& operator=(const Mapped&) = delete;\n  Mapped(Mapped&& o) noexcept\n      : data_(nullptr), bytes_(o.bytes_), owned_(std::move(o.owned_)), mapped_(o.mapped_) {\n    data_ = o.mapped_ ? static_cast<const std::uint8_t*>(o.mapped_) : owned_.data();\n    o.mapped_ = nullptr;\n    o.data_ = nullptr;\n    o.bytes_ = 0;\n  }\n  ~Mapped() {\n#ifdef HPCBENCH_HAVE_MMAP\n    if (mapped_) ::munmap(mapped_, bytes_);\n#endif\n  }\n  const std::uint8_t* data() const { return data_; }\n  std::size_t bytes() const { return bytes_; }\n  /** The mapping reinterpreted, for a file you wrote as fixed-width records. */\n  template <typename T>\n  const T* as(std::size_t byte_offset = 0) const {\n    return reinterpret_cast<const T*>(data_ + byte_offset);\n  }\n\n private:\n  const std::uint8_t* data_ = nullptr;\n  std::size_t bytes_ = 0;\n  std::vector<std::uint8_t> owned_;\n  void* mapped_ = nullptr;\n};\n\n/** The workdir as `solve` sees it. Everything you call on it is on the clock:\n *  reading your own representation is part of your entry. */\nstruct Work {\n  std::string dir_path;\n\n  Reader open(const char* name) const { return Reader(dir_path + \"/\" + name); }\n  Mapped map(const char* name) const { return Mapped(dir_path + \"/\" + name); }\n  std::vector<std::uint8_t> read_all(const char* name) const {\n    Reader r = open(name);\n    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(r.size()));\n    r.read(bytes.data(), bytes.size());\n    return bytes;\n  }\n  const char* dir() const { return dir_path.c_str(); }\n};\n\n/** The host's definition of the problem for this run. W is already generated:\n *  there is no gen_W in an entry any more, and no time to be spent on it. */\nstruct Params {\n  std::uint64_t k;\n  const double* W;  // row-major n_genes x k\n  std::uint64_t n_cells;\n  std::uint64_t n_genes;\n};\n\n/** The output, preallocated and zero-filled by the harness. Row-major\n *  n_cells x k. Writing it to disk is the harness's job, after the clock stops. */\nstruct Result {\n  double* data;\n  std::uint64_t n_cells;\n  std::uint64_t k;\n};\n\n// The two functions an entry provides. Nothing else is linked from an entry.\nvoid prepare(const Input& in, Sink& out);\nvoid solve(const Work& w, const Params& p, Result& y);\n\n}  // namespace hpcbench\n\n// An entry file must not define main(): the harness owns the process. Defining\n// one would either collide with the harness or, worse, replace it and skip the\n// timing boundary entirely. `main` is renamed onto an object, so a definition\n// becomes a compile error whose text says which rule it broke. (Renaming it\n// onto a *type* is not enough: C++ lets a function hide a class name, so the\n// definition would compile and sit there dead.)\nnamespace hpcbench {\nnamespace {\nconst int hpcbench_error_entry_files_must_not_define_main_the_harness_owns_it = 0;\n}\n}  // namespace hpcbench\nusing hpcbench::hpcbench_error_entry_files_must_not_define_main_the_harness_owns_it;\n#ifndef HPCBENCH_HARNESS_TU\n#define main hpcbench_error_entry_files_must_not_define_main_the_harness_owns_it\n#endif\n\n\n#endif  // HPCBENCH_TASK_HPP\n",
+      "include/canon.hpp": "// ============================================================================\n// hpcbench canonical result writer.\n//\n// Emit your answer with write_result(). The grader hashes the file after\n// quantizing to the task's declared significant digits, so a vectorized or\n// threaded reduction that reorders floating-point additions still produces the\n// same checksum as the scalar reference -- provided it agrees to that\n// precision. Bit-exactness is NOT required (and would be unachievable).\n//\n// Usage:\n//     #include \"canon.hpp\"\n//     std::vector<double> out = ...;\n//     hpcbench::write_result(argv[2], out, {n_rows, n_cols});\n//\n// DO NOT MODIFY. The grader has its own copy.\n// ============================================================================\n#pragma once\n\n#include <cstdint>\n#include <cstdio>\n#include <cstring>\n#include <initializer_list>\n#include <stdexcept>\n#include <string>\n#include <vector>\n\nnamespace hpcbench {\n\nconstexpr std::uint32_t kCanonVersion = 1;\n\ninline void write_result(const std::string& path,\n                         const double* data,\n                         std::uint64_t n,\n                         std::initializer_list<std::uint64_t> dims = {}) {\n  std::FILE* f = std::fopen(path.c_str(), \"wb\");\n  if (!f) throw std::runtime_error(\"cannot open result file: \" + path);\n\n  std::fwrite(\"HPCBENCH\", 1, 8, f);\n  std::uint32_t version = kCanonVersion;\n  std::uint32_t ndim = static_cast<std::uint32_t>(dims.size());\n  std::fwrite(&version, sizeof(version), 1, f);\n  std::fwrite(&ndim, sizeof(ndim), 1, f);\n  for (std::uint64_t d : dims) std::fwrite(&d, sizeof(d), 1, f);\n  std::fwrite(&n, sizeof(n), 1, f);\n  std::fwrite(data, sizeof(double), n, f);\n\n  if (std::fclose(f) != 0)\n    throw std::runtime_error(\"failed to close result file: \" + path);\n}\n\ninline void write_result(const std::string& path,\n                         const std::vector<double>& v,\n                         std::initializer_list<std::uint64_t> dims = {}) {\n  write_result(path, v.data(), static_cast<std::uint64_t>(v.size()), dims);\n}\n\n}  // namespace hpcbench\n",
+      "include/task_io.hpp": "// task_io.hpp \u2014 HOST-OWNED. Read-only for competitors.\n//\n// This header holds the two pieces of the task that are the host's definition of\n// the problem rather than anyone's optimisation:\n//\n//   hpcbench::gen_W          the weights every entry must multiply by\n//   hpcbench::read_raw_input reading the raw corpus in prepare\n//\n// Both bodies are lifted BYTE FOR BYTE from the baseline they replace, and the\n// refactored baseline is gated on producing bit-identical results at every\n// published sweep value. Nothing about the answer changed.\n//\n// Why it is here instead of copied into every entry: while `gen_W` lives in each\n// entry's own solution.cpp, it is a pure function of `k`, and a pure function of\n// a small published set of `k` can be precomputed into a lookup table. The fix\n// is to make W depend on a value that does not exist when `prepare` runs, and\n// that is only possible if there is ONE `gen_W` that the host controls.\n//\n// ANTICIPATED CHANGE \u2014 the session nonce. `gen_W` already takes a trailing\n// `session_nonce` with a default of 0, and today it is RESERVED: nothing reads\n// it, so the weights are exactly the historical ones. When the host turns the nonce on, the runner will pass the session's\n// value and nothing at any call site has to change. Do not add parameters before\n// that one, and do not change what `session_nonce == 0` computes: every stored\n// reference digest depends on it.\n//\n// The runners stage this file LAST, after an entry's own sources, so an entry\n// that ships a file at this path cannot replace it.\n#ifndef HPCBENCH_TASK_IO_HPP\n#define HPCBENCH_TASK_IO_HPP\n\n#include <fcntl.h>\n#include <unistd.h>\n\n#include <cstddef>\n#include <cstdint>\n#include <cstdio>\n#include <vector>\n\nnamespace hpcbench {\n\n// A bounded open()/read() loop. REGRESSION GUARD -- do NOT replace this with\n// buffered stdio (std::ifstream/fread). hpcbench also runs entries in a browser\n// tab, and the vendored memfs there (public/wasm-clang/shared.js) has a broken\n// fd_read: its copy_out helper builds a typed-array view over the memfs\n// WebAssembly.Memory using the caller's full requested length, past the end of\n// the file region, and throws \"Invalid typed array length: <file size>\".\n// Buffered stdio asks for large readahead chunks and trips it on this ~296 MB\n// input.\ninline bool read_exact_fd(int fd, void* dst, std::size_t n) {\n  unsigned char* p = static_cast<unsigned char*>(dst);\n  const std::size_t chunk = std::size_t(1) << 20;\n  while (n > 0) {\n    const std::size_t want = n < chunk ? n : chunk;\n    const ssize_t got = ::read(fd, p, want);\n    if (got <= 0) return false;\n    p += got;\n    n -= static_cast<std::size_t>(got);\n  }\n  return true;\n}\n\n/** Reads the raw corpus: two u64 dimensions, then n_cells * n_genes doubles,\n *  row-major. Returns false and leaves a message on stderr on any failure. */\ninline bool read_raw_input(const char* path, std::uint64_t& n_cells, std::uint64_t& n_genes,\n                           std::vector<double>& X) {\n  const int fd = ::open(path, O_RDONLY);\n  if (fd < 0) {\n    std::fprintf(stderr, \"cannot open %s\\n\", path);\n    return false;\n  }\n  n_cells = 0;\n  n_genes = 0;\n  if (!read_exact_fd(fd, &n_cells, 8) || !read_exact_fd(fd, &n_genes, 8)) {\n    std::fprintf(stderr, \"truncated input\\n\");\n    ::close(fd);\n    return false;\n  }\n  X.assign(n_cells * n_genes, 0.0);\n  if (!read_exact_fd(fd, X.data(), X.size() * sizeof(double))) {\n    std::fprintf(stderr, \"truncated input\\n\");\n    ::close(fd);\n    return false;\n  }\n  ::close(fd);\n  return true;\n}\n\n/** The weights, identical for every entry. Body lifted byte for byte from the\n *  baseline's `gen_W`. `session_nonce == 0` is the historical definition and is\n *  what every stored reference digest was produced with; see the note above. */\ninline std::vector<double> gen_W(std::uint64_t n_genes, std::uint64_t k,\n                                 std::uint64_t session_nonce = 0) {\n  std::vector<double> W(n_genes * k);\n  std::uint64_t s = 0x9E3779B97F4A7C15ull ^ (k * 0xBF58476D1CE4E5B9ull);\n  // The nonce is RESERVED and deliberately unused: turning it on changes the\n  // answer for every existing entry, so it is the host's call and his timing.\n  // When he makes it, this is the one line that changes:\n  //     if (session_nonce != 0) s ^= session_nonce * 0x94D049BB133111EBull;\n  (void)session_nonce;\n  for (std::uint64_t i = 0; i < W.size(); ++i) {\n    s ^= s >> 30; s *= 0xBF58476D1CE4E5B9ull;\n    s ^= s >> 27; s *= 0x94D049BB133111EBull;\n    s ^= s >> 31;\n    W[i] = (double(s >> 11) * (1.0 / 9007199254740992.0)) * 2.0 - 1.0;\n  }\n  return W;\n}\n\n}  // namespace hpcbench\n\n#endif  // HPCBENCH_TASK_IO_HPP\n"
+    },
+    "notes": "The harness owns main and dispatches on argv: `task prepare <raw_input> <workdir>` and `task solve <workdir> <result.bin> <k>`. Only your hpcbench::solve is timed; the weights, the output buffer and writing result.bin are outside the clock. Y is row-major n_cells x k and arrives zero-filled. Natively the harness prints HPCBENCH_TIME_MS; in a browser tab, where this sysroot has no clock, it brackets the call with HPCBENCH_SOLVE_BEGIN/END and the runner timestamps those.",
+    "solution_signature": "void hpcbench::solve(const Work& w, const Params& p, Result& y)"
+  },
+  "reference_digests": [
+    {
+      "sweep_key": "8",
+      "digest": "6bf177b4204b2ad3dd3a9f88d03d1d986385b66db0189c3c2df7e704e813f32b"
+    },
+    {
+      "sweep_key": "16",
+      "digest": "707f7472caa28ae902b5310a2f561b4f3da3348224f33965acf71f98929752f7"
+    },
+    {
+      "sweep_key": "32",
+      "digest": "34517c020ca70113404a0536c7b7458abd71875543de4b3936e4188fee591793"
+    },
+    {
+      "sweep_key": "64",
+      "digest": "d9bd1307cf2133a2e56fde3b0eb92663a35919e6d98c61dd41726b602b0d3842"
+    },
+    {
+      "sweep_key": "128",
+      "digest": "3488abe1a4b5f588395ee504f6ea546ef2acedbdc0378aaf648619c96d68d173"
+    },
+    {
+      "sweep_key": "256",
+      "digest": "fe504678b9ec1cfadd6e48fa80aade9549d15481b6e6d0fb53a0c38a2d6d7664"
+    }
+  ],
+  "submissions": [
+    {
+      "id": "c83c3780-9ab1-4b06-99f1-34ad712c3f7c",
+      "name": "baseline",
+      "is_baseline": true,
+      "version": 2,
+      "owner_handle": "zachdebruine",
+      "updated_at": "2026-09-10T02:08:44.181+00:00",
+      "reason": "baseline \u2014 required for same-session scoring",
+      "files": {
+        "harness.cpp": "// ============================================================================\n// hpcbench fixed harness -- CIS 677 P1. HOST-OWNED. DO NOT EDIT: every entry is\n// compiled and linked against this file exactly as written.\n//\n// One binary, two modes:\n//\n//     ./build/task prepare <raw_input> <workdir>      UNTIMED\n//     ./build/task solve   <workdir> <result.bin> <k> TIMED\n//\n// `prepare` reads the raw corpus and calls the entry's `hpcbench::prepare`,\n// which writes whatever representation it wants into the workdir.\n//\n// `solve` generates the weights, allocates and zero-fills the output, then\n// starts a clock, calls the entry's `hpcbench::solve`, and stops it. Reading the\n// entry's own representation happens inside `solve` and is therefore on the\n// clock -- that is the point of the design. Everything the host does is outside\n// it: process start-up, generating W, allocating Y, writing result.bin and\n// digesting it are no longer charged to anyone.\n//\n// The timed region is announced on stdout, always, around the call:\n//\n//     HPCBENCH_SOLVE_BEGIN\n//     HPCBENCH_SOLVE_END\n//     HPCBENCH_TIME_MS <milliseconds>\n//\n// The last line is printed only where the platform has a monotonic clock. The\n// browser's wasm sysroot does not implement clock_time_get, so a `steady_clock`\n// call there traps; the in-tab runner instead timestamps the two markers as it\n// receives them, which measures the same region from outside the program.\n//\n// DIMENSIONS. The workdir belongs to the entry and the host does not parse it,\n// so `prepare` mode records the corpus dimensions in a host-owned sidecar,\n// <workdir>/.hpcbench-dims (two little-endian u64: n_cells, n_genes). `solve`\n// reads that, not the entry's files, to size W and Y. Reading it is untimed.\n// ============================================================================\n#define HPCBENCH_HARNESS_TU 1\n\n#include \"canon.hpp\"\n#include \"task.hpp\"\n\n#if defined(__wasm__) || defined(__EMSCRIPTEN__)\n// No clock_time_get in this sysroot: calling steady_clock::now() traps.\n#define HPCBENCH_NO_STEADY_CLOCK 1\n#else\n#include <chrono>\n#endif\n\n#include <cstdint>\n#include <cstdio>\n#include <cstdlib>\n#include <cstring>\n#include <string>\n#include <vector>\n\nnamespace {\n\nconst char* kDimsFile = \"/.hpcbench-dims\";\n\nvoid write_dims(const std::string& workdir, std::uint64_t n_cells, std::uint64_t n_genes) {\n  hpcbench::Writer w(workdir + kDimsFile);\n  w.write_value(n_cells);\n  w.write_value(n_genes);\n  w.close();\n}\n\nvoid read_dims(const std::string& workdir, std::uint64_t& n_cells, std::uint64_t& n_genes) {\n  hpcbench::Reader r(workdir + kDimsFile);\n  n_cells = r.read_value<std::uint64_t>();\n  n_genes = r.read_value<std::uint64_t>();\n  if (n_cells == 0 || n_genes == 0) hpcbench::fatal(\"workdir dimensions are empty; re-run prepare\");\n}\n\nint usage() {\n  std::fprintf(stderr,\n               \"usage: task prepare <raw_input> <workdir>\\n\"\n               \"       task solve   <workdir> <result.bin> <k>\\n\");\n  return 2;\n}\n\n}  // namespace\n\nint main(int argc, char** argv) {\n  if (argc < 2) return usage();\n  const std::string mode = argv[1];\n\n  if (mode == \"prepare\") {\n    if (argc < 4) return usage();\n    const std::string workdir = argv[3];\n\n    std::uint64_t n_cells = 0, n_genes = 0;\n    std::vector<double> X;\n    if (!hpcbench::read_raw_input(argv[2], n_cells, n_genes, X)) return 1;\n\n    hpcbench::Input in{n_cells, n_genes, X.data()};\n    hpcbench::Sink sink{workdir};\n    hpcbench::prepare(in, sink);\n    write_dims(workdir, n_cells, n_genes);\n\n    std::fprintf(stderr, \"prepare: %llu x %llu\\n\", (unsigned long long)n_cells,\n                 (unsigned long long)n_genes);\n    return 0;\n  }\n\n  if (mode == \"solve\") {\n    if (argc < 5) return usage();\n    const std::string workdir = argv[2];\n    const std::string result_path = argv[3];\n    const std::uint64_t k = std::strtoull(argv[4], nullptr, 10);\n    if (k == 0) hpcbench::fatal(\"k must be a positive integer\");\n\n    std::uint64_t n_cells = 0, n_genes = 0;\n    read_dims(workdir, n_cells, n_genes);\n\n    // Untimed: the problem definition and the output buffer.\n    const std::vector<double> W = hpcbench::gen_W(n_genes, k);\n    std::vector<double> Y(n_cells * k, 0.0);\n\n    hpcbench::Work work{workdir};\n    hpcbench::Params params{k, W.data(), n_cells, n_genes};\n    hpcbench::Result out{Y.data(), n_cells, k};\n\n    // The markers bracket the timed region for a runner with no clock inside\n    // the program. They are flushed so the timestamps are the real boundaries.\n    std::printf(\"HPCBENCH_SOLVE_BEGIN\\n\");\n    std::fflush(stdout);\n#ifndef HPCBENCH_NO_STEADY_CLOCK\n    const auto t0 = std::chrono::steady_clock::now();\n#endif\n    hpcbench::solve(work, params, out);\n#ifndef HPCBENCH_NO_STEADY_CLOCK\n    const auto t1 = std::chrono::steady_clock::now();\n#endif\n    std::printf(\"HPCBENCH_SOLVE_END\\n\");\n    std::fflush(stdout);\n#ifndef HPCBENCH_NO_STEADY_CLOCK\n    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();\n    std::printf(\"HPCBENCH_TIME_MS %.6f\\n\", ms);\n    std::fflush(stdout);\n#endif\n\n    // Untimed: writing and digesting the answer.\n    hpcbench::write_result(result_path.c_str(), Y, {n_cells, k});\n    return 0;\n  }\n\n  return usage();\n}\n",
+        "src/main.cpp": "// The fixed harness now lives in harness.cpp, which is linked into every entry.\n// Nothing is compiled from this file; it is kept only so an older tool that\n// writes src/main.cpp does not write a stale harness there.\n",
+        "src/prepare.cpp": "// src/prepare.cpp -- YOURS. UNTIMED.\n//\n// One function, no main(), no argv, no file format you have to guess:\n//\n//     void hpcbench::prepare(const Input& in, Sink& out);\n//\n// `in` is the raw corpus, already read for you: `in.X` is row-major\n// n_cells x n_genes doubles. `out` is your workdir; `out.create(\"name\")` hands\n// you a Writer. Whatever you write here is what `solve` has to read, and that\n// decision is most of the project.\n//\n// Nothing here is on the clock. Sort it, compress it, quantise it, shard it,\n// build an index. Note what is NOT in `Input`: `k`. The sweep value does not\n// exist yet, so it cannot be tabled.\n//\n// The baseline writes the dense matrix straight back out, which is the worst\n// possible answer and is the point.\n#include \"task.hpp\"\n\n#include <cstdint>\n#include <cstdio>\n\nvoid hpcbench::prepare(const Input& in, Sink& out) {\n  Writer w = out.create(\"matrix.bin\");\n  w.write_value(in.n_cells);\n  w.write_value(in.n_genes);\n  w.write(in.X, static_cast<std::size_t>(in.n_cells * in.n_genes) * sizeof(double));\n  w.close();\n\n  std::uint64_t nnz = 0;\n  const std::uint64_t n = in.n_cells * in.n_genes;\n  for (std::uint64_t i = 0; i < n; ++i)\n    if (in.X[i] != 0.0) ++nnz;\n  std::fprintf(stderr, \"prepare: %llu nonzeros of %llu (%.2f%% dense)\\n\",\n               (unsigned long long)nnz, (unsigned long long)n,\n               100.0 * double(nnz) / double(n));\n}\n",
+        "src/solution.cpp": "// src/solution.cpp -- YOURS, and the ONLY thing timed.\n//\n//     void hpcbench::solve(const Work& w, const Params& p, Result& y);\n//\n// The clock starts on entry to this function and stops on return. Everything\n// else -- process start-up, generating the weights, allocating and zero-filling\n// `y`, writing result.bin, digesting it -- happens outside the timed region and\n// costs you nothing.\n//\n// What that means in practice: reading your own representation out of the\n// workdir is INSIDE the clock. `w.open(name)` streams it, `w.map(name)` gives\n// you the whole file, `w.read_all(name)` slurps it. Choosing between them, and\n// choosing how little you need to read at all, is part of the optimisation.\n//\n// `p.W` is row-major n_genes x k, already generated by the host: there is no\n// gen_W in an entry any more. `y.data` is row-major n_cells x k and arrives\n// zero-filled. Compute Y = X * W.\n//\n// The baseline reads the dense matrix the baseline `prepare` wrote and runs the\n// textbook triple loop. Both halves are yours to replace.\n#include \"task.hpp\"\n\n#include <cstdint>\n#include <vector>\n\nvoid hpcbench::solve(const Work& w, const Params& p, Result& y) {\n  // On the clock: the baseline pays to read 296 MB of dense doubles.\n  Reader r = w.open(\"matrix.bin\");\n  const std::uint64_t n_cells = r.read_value<std::uint64_t>();\n  const std::uint64_t n_genes = r.read_value<std::uint64_t>();\n  std::vector<double> X(static_cast<std::size_t>(n_cells * n_genes));\n  r.read(X.data(), X.size() * sizeof(double));\n  r.close();\n\n  const std::uint64_t k = p.k;\n  for (std::uint64_t i = 0; i < n_cells; ++i)\n    for (std::uint64_t g = 0; g < n_genes; ++g)\n      for (std::uint64_t c = 0; c < k; ++c)\n        y.data[i * k + c] += X[i * n_genes + g] * p.W[g * k + c];\n}\n",
+        "build.sh": "#!/bin/sh\n# build.sh -- YOURS to edit. Flags, vectorisation, OpenMP, LTO: all fair game.\n#\n# It must produce ONE binary at build/task, linking the host harness with your\n# two source files:\n#\n#     harness.cpp        host-owned: main, argv, the timing boundary\n#     src/prepare.cpp    yours, untimed\n#     src/solution.cpp   yours, timed\n#\n# Your files must not define main(); the harness owns the process. That is\n# checked below, and again by the compiler.\nset -eu\n\nCXX=${CXX:-c++}\nCXXFLAGS=${CXXFLAGS:--O3 -std=c++17 -DNDEBUG}\n\nfor f in src/prepare.cpp src/solution.cpp; do\n  [ -f \"$f\" ] || { echo \"build.sh: missing $f\" >&2; exit 1; }\n  if grep -Eq '^[[:space:]]*(int|auto)[[:space:]]+main[[:space:]]*\\(' \"$f\"; then\n    echo \"build.sh: $f defines main(); the harness owns main. Your file provides\" >&2\n    echo \"          only hpcbench::prepare or hpcbench::solve.\" >&2\n    exit 1\n  fi\ndone\n\nmkdir -p build\n\nprobe() {\n  printf 'int main(){return 0;}\\n' > build/.probe.cpp\n  # shellcheck disable=SC2086\n  $CXX $1 build/.probe.cpp -o build/.probe 2>/dev/null && echo \"$1\" || true\n  rm -f build/.probe.cpp build/.probe\n}\n\nEXTRA=\"$(probe -march=native) $(probe -fopenmp)\"\n\n# shellcheck disable=SC2086\n$CXX $CXXFLAGS $EXTRA -Iinclude \\\n  harness.cpp src/prepare.cpp src/solution.cpp \\\n  -o build/task\n\necho \"built build/task with $CXX $CXXFLAGS $EXTRA\"\n"
+      }
+    }
+  ],
+  "skipped": [
+    {
+      "id": "c175c542-67e6-45ec-b40c-dc38563692df",
+      "name": "ahsan-01",
+      "owner_handle": "kowshid",
+      "reason": "last run on your account was build_failed and the source has not changed since"
+    },
+    {
+      "id": "abe122eb-ceea-492c-841a-d003785506b0",
+      "name": "ahsan-02",
+      "owner_handle": "kowshid",
+      "reason": "not in owner's top 3 and unchanged since the last run on your account"
+    },
+    {
+      "id": "4e142fc2-adba-470a-8c79-046bc03ba291",
+      "name": "ahsan-03",
+      "owner_handle": "kowshid",
+      "reason": "not in owner's top 3 and unchanged since the last run on your account"
+    },
+    {
+      "id": "d804526d-d34f-41b1-947e-fd67d05a4323",
+      "name": "ahsan-04",
+      "owner_handle": "kowshid",
+      "reason": "not in owner's top 3 and unchanged since the last run on your account"
+    },
+    {
+      "id": "0b651029-b529-4b34-9526-458228b170d6",
+      "name": "bitshift",
+      "owner_handle": "zachdebruine",
+      "reason": "another participant's entry \u2014 its source stays private until the competition closes"
+    },
+    {
+      "id": "8d427dbc-80f0-4606-b4d5-80c9c4d01510",
+      "name": "dbaine-v3",
+      "owner_handle": "bained",
+      "reason": "another participant's entry \u2014 its source stays private until the competition closes"
+    },
+    {
+      "id": "f63558d1-3f3c-4d22-803f-bac95091357e",
+      "name": "entry-1",
+      "owner_handle": "nancy",
+      "reason": "another participant's entry \u2014 its source stays private until the competition closes"
+    },
+    {
+      "id": "6374ccdc-027d-46e2-ad51-bfc3504b1cae",
+      "name": "entry-10",
+      "owner_handle": "ghnimim",
+      "reason": "another participant's entry \u2014 its source stays private until the competition closes"
+    },
+    {
+      "id": "3e06aaef-be26-4c49-8ef1-00112992d0b4",
+      "name": "entry-11",
+      "owner_handle": "ghnimim",
+      "reason": "another participant's entry \u2014 its source stays private until the competition closes"
+    },
+    {
+      "id": "e88b4943-4e7a-45ef-9e46-f602f9ec4aad",
+      "name": "entry-12",
+      "owner_handle": "ghnimim",
+      "reason": "another participant's entry \u2014 its source stays private until the competition closes"
+    },
+    {
+      "id": "db87879a-50f4-461b-8e9c-f566bc0beb85",
+      "name": "entry-13",
+      "owner_handle": "ghnimim",
+      "reason": "another participant's entry \u2014 its source stays private until the competition closes"
+    },
+    {
+      "id": "c72d079a-daee-4b77-961c-889131737483",
+      "name": "entry-14",
+      "owner_handle": "alaoua mohamed",
+      "reason": "another participant's entry \u2014 its source stays private until the competition closes"
+    },
+    {
+      "id": "d3602ad7-7418-49e3-9a10-e8ca6e80b98d",
+      "name": "entry-15",
+      "owner_handle": "castelsa",
+      "reason": "another participant's entry \u2014 its source stays private until the competition closes"
+    },
+    {
+      "id": "3d1f51b3-c60e-4e5f-a46f-43a090c380d4",
+      "name": "entry-16",
+      "owner_handle": "castelsa",
+      "reason": "another participant's entry \u2014 its source stays private until the competition closes"
+    },
+    {
+      "id": "b2f3b155-71d9-4c57-9d87-d6175defeae7",
+      "name": "entry-2",
+      "owner_handle": "castelsa",
+      "reason": "another participant's entry \u2014 its source stays private until the competition closes"
+    },
+    {
+      "id": "36c12ff6-383d-4c92-977b-91f57db48d5e",
+      "name": "entry-3",
+      "owner_handle": "alaoua mohamed",
+      "reason": "another participant's entry \u2014 its source stays private until the competition closes"
+    },
+    {
+      "id": "bdba590b-0aae-4a7c-af20-beaeecc343ac",
+      "name": "entry-4",
+      "owner_handle": "alaoua mohamed",
+      "reason": "another participant's entry \u2014 its source stays private until the competition closes"
+    },
+    {
+      "id": "130a206c-62b9-4205-a730-8906f529e9da",
+      "name": "entry-5",
+      "owner_handle": "alaoua mohamed",
+      "reason": "another participant's entry \u2014 its source stays private until the competition closes"
+    },
+    {
+      "id": "d5870f1d-91ef-4c97-8d64-3d10c1353b0f",
+      "name": "entry-6",
+      "owner_handle": "nancy",
+      "reason": "another participant's entry \u2014 its source stays private until the competition closes"
+    },
+    {
+      "id": "316c4bb0-4096-4332-ac40-c5947ad863cf",
+      "name": "entry-7",
+      "owner_handle": "nancy",
+      "reason": "another participant's entry \u2014 its source stays private until the competition closes"
+    },
+    {
+      "id": "ccbf86de-267a-4bb6-ad0b-3b7ae18a03d2",
+      "name": "entry-8",
+      "owner_handle": "nancy",
+      "reason": "another participant's entry \u2014 its source stays private until the competition closes"
+    },
+    {
+      "id": "2a3aa290-bd92-40bd-a901-6cbf4c730f24",
+      "name": "entry-9",
+      "owner_handle": "ghnimim",
+      "reason": "another participant's entry \u2014 its source stays private until the competition closes"
+    },
+    {
+      "id": "b55aa922-a345-49fb-a498-c7612974f91c",
+      "name": "panel-csc",
+      "owner_handle": "zachdebruine",
+      "reason": "another participant's entry \u2014 its source stays private until the competition closes"
+    },
+    {
+      "id": "91d82f97-e664-4407-958c-df892330f887",
+      "name": "qa-browser-check",
+      "owner_handle": null,
+      "reason": "another participant's entry \u2014 its source stays private until the competition closes"
+    },
+    {
+      "id": "f2d50038-8f98-4443-8965-f016f81073df",
+      "name": "qa-browser-check2",
+      "owner_handle": null,
+      "reason": "another participant's entry \u2014 its source stays private until the competition closes"
+    },
+    {
+      "id": "71ad3e10-32d1-4ac1-9642-4b3333567bed",
+      "name": "sparse-csr",
+      "owner_handle": "zachdebruine",
+      "reason": "another participant's entry \u2014 its source stays private until the competition closes"
+    }
+  ]
+}
