@@ -6,6 +6,7 @@ target/
 .bin/
 *.bin
 build/
+.hpcbench-dims
 
 .kotlin
 .venv/
